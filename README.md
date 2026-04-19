@@ -1,4 +1,4 @@
-# ⚡ CommitOrDie
+#  Kronos
 
 > A distributed key-value store built from scratch with a hand-crafted Raft consensus engine —  
 > leader election, log replication, fault tolerance, and snapshots. No libraries. No shortcuts.
@@ -248,12 +248,12 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    subgraph Partition A — minority
+    subgraph PartitionA ["Partition A · minority"]
         N1["Node 1<br/>Old leader<br/>Term 3"]
         N2["Node 2<br/>Follower"]
     end
 
-    subgraph Partition B — majority
+    subgraph PartitionB ["Partition B · majority"]
         N3["Node 3<br/>New leader<br/>Term 4"]
         N4["Node 4<br/>Follower"]
         N5["Node 5<br/>Follower"]
