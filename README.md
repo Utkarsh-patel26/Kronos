@@ -1,4 +1,4 @@
-#  Kronos
+# ⚡ Kronos
 
 > A distributed key-value store built from scratch with a hand-crafted Raft consensus engine —  
 > leader election, log replication, fault tolerance, and snapshots. No libraries. No shortcuts.
@@ -7,7 +7,7 @@
 
 ## What Is This?
 
-CommitOrDie is a **production-grade distributed key-value store** implemented entirely from scratch in Java. It is the kind of system that sits underneath etcd, CockroachDB, and TiKV — the layer that makes distributed databases safe and consistent even when machines crash, networks partition, and clocks drift.
+Kronos is a **production-grade distributed key-value store** implemented entirely from scratch in Java. It is the kind of system that sits underneath etcd, CockroachDB, and TiKV — the layer that makes distributed databases safe and consistent even when machines crash, networks partition, and clocks drift.
 
 At its core is a hand-written implementation of the **Raft consensus algorithm** — the mechanism that allows a cluster of independent nodes to behave as a single, coherent system. Every design decision in this project mirrors what real distributed systems engineers face: how do you ensure no two nodes ever disagree on committed state? How do you elect a new leader in milliseconds without data loss? How do you keep the log from growing forever?
 
@@ -44,20 +44,20 @@ Raft solves all three, provably.
 
 ```mermaid
 graph TB
-    Client["🖥️ Client<br/>(SDK / HTTP / CLI)"]
+    Client["Client (SDK / HTTP / CLI)"]
 
     subgraph Cluster ["Raft Cluster (3 or 5 nodes)"]
         direction TB
 
-        subgraph Leader ["Node 1 — Leader"]
+        subgraph LeaderNode ["Node 1 · Leader"]
             LE["Raft Engine"]
             LL["Raft Log"]
-            LSM["State Machine<br/>(KV HashMap)"]
+            LSM["State Machine (KV HashMap)"]
             LE --> LL
             LL --> LSM
         end
 
-        subgraph Follower2 ["Node 2 — Follower"]
+        subgraph Follower2 ["Node 2 · Follower"]
             FE2["Raft Engine"]
             FL2["Raft Log"]
             FSM2["State Machine"]
@@ -65,7 +65,7 @@ graph TB
             FL2 --> FSM2
         end
 
-        subgraph Follower3 ["Node 3 — Follower"]
+        subgraph Follower3 ["Node 3 · Follower"]
             FE3["Raft Engine"]
             FL3["Raft Log"]
             FSM3["State Machine"]
@@ -80,12 +80,12 @@ graph TB
     end
 
     subgraph Storage ["Persistent Storage (per node)"]
-        WAL["WAL / RocksDB<br/>Append-only log"]
-        SNAP["Snapshot store<br/>Compacted state"]
+        WAL["WAL / RocksDB · Append-only log"]
+        SNAP["Snapshot store · Compacted state"]
     end
 
-    Client -- "PUT / GET / DELETE" --> Leader
-    Leader -- "200 OK (after commit)" --> Client
+    Client -- "PUT / GET / DELETE" --> LeaderNode
+    LeaderNode -- "200 OK (after commit)" --> Client
     LSM --> WAL
     LSM --> SNAP
 ```
@@ -102,11 +102,11 @@ Every node in a Raft cluster is always in exactly one of three states:
 stateDiagram-v2
     [*] --> Follower : Node starts up
 
-    Follower --> Candidate : Election timeout fires\n(150–300ms, randomized)
-    Candidate --> Follower : Discovers node with higher term\nor another leader
-    Candidate --> Candidate : Election timeout fires\n(split vote — retry)
+    Follower --> Candidate : Election timeout fires (150-300ms randomized)
+    Candidate --> Follower : Discovers node with higher term or another leader
+    Candidate --> Candidate : Election timeout fires (split vote, retry)
     Candidate --> Leader : Receives votes from majority
-    Leader --> Follower : Discovers higher term\n(deposed by new election)
+    Leader --> Follower : Discovers higher term (deposed by new election)
 ```
 
 | Role | What It Does |
@@ -132,16 +132,16 @@ sequenceDiagram
     N1->>N2: RequestVote(term=4, lastLogIndex=47, lastLogTerm=3)
     N1->>N3: RequestVote(term=4, lastLogIndex=47, lastLogTerm=3)
 
-    Note over N2: Checks: term 4 > my term 3 ✓<br/>Haven't voted in term 4 ✓<br/>Candidate log ≥ my log ✓<br/>Grants vote.
+    Note over N2: term 4 > my term 3<br/>Haven't voted in term 4<br/>Candidate log is up to date<br/>Grants vote.
 
     N2-->>N1: VoteGranted(term=4)
 
-    Note over N1: Has votes from self + N2 = majority (2/3).<br/>Immediately becomes Leader for term 4.
+    Note over N1: Votes from self + N2 = majority (2/3).<br/>Becomes Leader for term 4.
 
-    N1->>N2: AppendEntries(term=4, entries=[]) — first heartbeat
-    N1->>N3: AppendEntries(term=4, entries=[]) — first heartbeat
+    N1->>N2: AppendEntries(term=4, entries=[]) - first heartbeat
+    N1->>N3: AppendEntries(term=4, entries=[]) - first heartbeat
 
-    Note over N3: VoteGranted reply arrives late.<br/>N1 is already leader — doesn't matter.
+    Note over N3: VoteGranted reply arrives late.<br/>N1 is already leader.
     N3-->>N1: VoteGranted(term=4)
 ```
 
@@ -166,24 +166,24 @@ sequenceDiagram
 
     C->>L: PUT username=alice
 
-    Note over L: Step 1: Append to local log<br/>entry={term:3, index:47, cmd:"PUT username=alice"}<br/>Persist to WAL. Do NOT apply yet.
+    Note over L: Append to local log<br/>entry={term:3, index:47, cmd:PUT username=alice}<br/>Persist to WAL. Do NOT apply yet.
 
     par Replicate in parallel
-        L->>F2: AppendEntries(prevIndex=46, prevTerm=3, entries=[{47,"PUT username=alice"}], leaderCommit=46)
-        L->>F3: AppendEntries(prevIndex=46, prevTerm=3, entries=[{47,"PUT username=alice"}], leaderCommit=46)
+        L->>F2: AppendEntries(prevIndex=46, prevTerm=3, entries=[47], leaderCommit=46)
+        L->>F3: AppendEntries(prevIndex=46, prevTerm=3, entries=[47], leaderCommit=46)
     end
 
-    Note over F2: Validates: log[46].term == 3 ✓<br/>Appends entry 47. Persists.
-    Note over F3: Validates: log[46].term == 3 ✓<br/>Appends entry 47. Persists.
+    Note over F2: Validates log consistency<br/>Appends entry 47. Persists.
+    Note over F3: Validates log consistency<br/>Appends entry 47. Persists.
 
     F2-->>L: Success(matchIndex=47)
     F3-->>L: Success(matchIndex=47)
 
-    Note over L: matchIndex[N2]=47, matchIndex[N3]=47<br/>Majority (self + N2) have index 47<br/>commitIndex = 47<br/>Apply to state machine: kv.put("username","alice")
+    Note over L: Majority (self + N2) have index 47<br/>commitIndex = 47<br/>Apply: kv.put(username, alice)
 
     L-->>C: 200 OK {committed: true, index: 47}
 
-    Note over F2,F3: Next heartbeat carries leaderCommit=47<br/>Followers advance their commitIndex<br/>and apply to their own state machines.
+    Note over F2,F3: Next heartbeat carries leaderCommit=47<br/>Followers advance commitIndex<br/>and apply to their own state machines.
 ```
 
 The key insight: **the client only hears success after the entry is committed on a majority**. If the leader crashes between replicating and responding, the new leader will already have the entry (it was on a majority), and the client's retry will be a no-op.
@@ -199,7 +199,7 @@ Index:  1        2        3        4        5        6        7
        ┌────────┬────────┬────────┬────────┬────────┬────────┬────────┐
 Term:  │ t=1    │ t=1    │ t=2    │ t=2    │ t=3    │ t=3    │ t=3    │
        │ PUT    │ PUT    │ PUT    │ DEL    │ PUT    │ CAS    │ PUT    │
-       │ x=1    │ y=2    │ x=5    │ y      │ z=99   │ x=5→7  │ w=hello│
+       │ x=1    │ y=2    │ x=5    │ y      │ z=99   │ x=5->7 │ w=hi   │
        └────────┴────────┴────────┴────────┴────────┴────────┴────────┘
                                    ▲
                             commitIndex=4
@@ -229,18 +229,18 @@ sequenceDiagram
     L->>F3: AppendEntries(index=47)
     F2-->>L: ACK
 
-    Note over L: CRASH — never receives F3's ACK.<br/>Never commits index 47.<br/>Never replies to client.
+    Note over L: CRASH - never receives F3 ACK.<br/>Never commits index 47.<br/>Never replies to client.
 
-    Note over F2,F3: No heartbeat for 200ms.<br/>Election timeout fires on F3 (fires first — randomized).
+    Note over F2,F3: No heartbeat for 200ms.<br/>Election timeout fires on F3 (randomized).
 
     F3->>F2: RequestVote(term=4, lastLogIndex=46, lastLogTerm=3)
-    Note over F2: F3's log matches. Grants vote.
+    Note over F2: F3 log matches. Grants vote.
     F2-->>F3: VoteGranted
 
-    Note over F3: F3 becomes leader (term 4).<br/>Entry 47 is on F2 but NOT committed.<br/>F3 will overwrite it during log repair<br/>OR recommit it if F2's entry matches.
+    Note over F3: F3 becomes leader (term 4).<br/>Entry 47 is on F2 but NOT committed.<br/>F3 overwrites during log repair<br/>OR recommits if entry matches.
 
     C->>F3: PUT username=alice (retry after timeout)
-    Note over F3: Processes as new write.<br/>Commits safely.
+    Note over F3: Processes as new write. Commits safely.
     F3-->>C: 200 OK
 ```
 
@@ -285,21 +285,21 @@ Without intervention, the Raft log grows forever. After 10,000 entries, replayin
 
 ```mermaid
 graph LR
-    subgraph Before compaction
+    subgraph BeforeCompaction ["Before compaction"]
         direction LR
-        E1["idx:1\nPUT x=1"]
-        E2["idx:2\nPUT y=2"]
-        E3["idx:3\nDEL x"]
-        E4["idx:4\nPUT z=9"]
-        E5["idx:5\nPUT x=7"]
-        E6["idx:6\n..."]
+        E1["idx:1<br/>PUT x=1"]
+        E2["idx:2<br/>PUT y=2"]
+        E3["idx:3<br/>DEL x"]
+        E4["idx:4<br/>PUT z=9"]
+        E5["idx:5<br/>PUT x=7"]
+        E6["idx:6<br/>..."]
         E1 --> E2 --> E3 --> E4 --> E5 --> E6
     end
 
-    subgraph After compaction
+    subgraph AfterCompaction ["After compaction"]
         direction LR
-        SNAP["SNAPSHOT\nlastIndex=5\nlastTerm=3\n─────────\ny=2\nz=9\nx=7"]
-        E6b["idx:6\n..."]
+        SNAP["SNAPSHOT<br/>lastIndex=5, lastTerm=3<br/>y=2, z=9, x=7"]
+        E6b["idx:6<br/>..."]
         SNAP --> E6b
     end
 ```
@@ -320,7 +320,7 @@ Two correct approaches:
 **Read-index (implemented here):**
 ```
 1. Leader records its current commitIndex as readIndex
-2. Leader sends a round of heartbeats to confirm it's still leader (majority responds)
+2. Leader sends a round of heartbeats to confirm it is still leader (majority responds)
 3. Leader waits until its state machine applies up to readIndex
 4. Leader serves the read
 ```
@@ -328,7 +328,7 @@ Two correct approaches:
 **Lease-based reads (optimization):**
 ```
 Leader maintains a time-bounded lease. If it received a majority heartbeat ACK
-within the last `electionTimeout / clockDriftBound` milliseconds, it is
+within the last electionTimeout / clockDriftBound milliseconds, it is
 guaranteed to still be the only leader — serve the read immediately without
 a heartbeat round.
 ```
@@ -342,13 +342,13 @@ flowchart TD
     A["Client sends PUT k=v"] --> B{"Request hits\nwhich node?"}
     B -- "Hits follower" --> C["Follower redirects\nto leader address"]
     C --> D
-    B -- "Hits leader" --> D["Leader appends entry\nto local log\n{term, index, cmd}"]
+    B -- "Hits leader" --> D["Leader appends entry\nto local log\nterm, index, cmd"]
     D --> E["Leader persists entry\nto WAL on disk"]
     E --> F["Fan out AppendEntries\nRPC to all followers\nin parallel"]
     F --> G{"Majority\nACK received?"}
-    G -- "No — timeout or\nnode unavailable" --> H["Retry with\nexponential backoff"]
+    G -- "No - timeout or\nnode unavailable" --> H["Retry with\nexponential backoff"]
     H --> G
-    G -- "Yes — majority\nappended" --> I["Advance commitIndex\nApply to state machine\nkv.put(k, v)"]
+    G -- "Yes - majority\nappended" --> I["Advance commitIndex\nApply to state machine\nkv.put(k, v)"]
     I --> J["Return 200 OK\nto client"]
     J --> K["Next heartbeat carries\nnew leaderCommit to followers"]
     K --> L["Followers apply\nentry to their own\nstate machines"]
@@ -389,30 +389,30 @@ Network I/O (gRPC) runs on a separate Netty thread pool. The HTTP API runs on Sp
 
 ```mermaid
 graph LR
-    subgraph IO Threads — Netty thread pool
-        GS["gRPC server\n(incoming RPCs)"]
-        GC["gRPC client stubs\n(outgoing RPCs)"]
+    subgraph IOThreads ["IO Threads · Netty thread pool"]
+        GS["gRPC server<br/>(incoming RPCs)"]
+        GC["gRPC client stubs<br/>(outgoing RPCs)"]
     end
 
-    subgraph Timer Threads
-        HB["Heartbeat timer\n50ms"]
-        ET["Election timer\n150–300ms"]
+    subgraph TimerThreads ["Timer Threads"]
+        HB["Heartbeat timer<br/>50ms"]
+        ET["Election timer<br/>150-300ms"]
     end
 
-    subgraph Raft Thread — single threaded
+    subgraph RaftThread ["Raft Thread · single threaded"]
         Q["Event queue"]
-        RSM["RaftStateMachine\nprocessEvent()"]
+        RSM["RaftStateMachine<br/>processEvent()"]
         Q --> RSM
     end
 
-    subgraph Application Threads — Spring Boot
-        HTTP["HTTP API\nPUT / GET / DELETE"]
+    subgraph AppThreads ["Application Threads · Spring Boot"]
+        HTTP["HTTP API<br/>PUT / GET / DELETE"]
     end
 
     GS -- "enqueue RPC event" --> Q
     HB -- "enqueue HeartbeatTick" --> Q
     ET -- "enqueue ElectionTimeout" --> Q
-    HTTP -- "enqueue ClientWrite\n(blocks until committed)" --> Q
+    HTTP -- "enqueue ClientWrite" --> Q
     RSM -- "schedule sends" --> GC
 ```
 
@@ -432,7 +432,7 @@ graph LR
 
 ## Failure Tolerance
 
-For a cluster of `n` nodes, Raft can tolerate up to `⌊(n-1)/2⌋` simultaneous failures:
+For a cluster of `n` nodes, Raft can tolerate up to `floor((n-1)/2)` simultaneous failures:
 
 | Cluster size | Majority needed | Failures tolerated |
 |:---:|:---:|:---:|
@@ -486,7 +486,7 @@ Every meaningful event in the consensus engine emits a metric via Micrometer, ex
 - [In Search of an Understandable Consensus Algorithm (Ongaro & Ousterhout, 2014)](https://raft.github.io/raft.pdf) — the original Raft paper
 - [Designing Data-Intensive Applications — Martin Kleppmann](https://dataintensive.net/) — Chapter 9 covers consistency and consensus at depth
 - [etcd internals](https://github.com/etcd-io/etcd) — production Raft in Go, good reference for edge cases
-- [The Log: What every software engineer should know about real-time data's unifying abstraction — Jay Kreps](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying) — essential reading on why the log is the right abstraction
+- [The Log: What every software engineer should know — Jay Kreps](https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying) — essential reading on why the log is the right abstraction
 
 ---
 
