@@ -1,0 +1,11 @@
+[versions]
+junit = "5.10.2"
+assertj = "3.25.3"
+mockito = "5.11.0"
+junit-platform = "1.10.2"
+
+[libraries]
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
+assertj-core = { module = "org.assertj:assertj-core", version.ref = "assertj" }
+mockito-core = { module = "org.mockito:mockito-core", version.ref = "mockito" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher", version.ref = "junit-platform" }

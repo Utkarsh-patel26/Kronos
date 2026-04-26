@@ -1,0 +1,15 @@
+# Gradle and build outputs
+.gradle/
+**/build/
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local planning/docs to keep out of git
+IMPLEMENTATION_PLAN (1).md
