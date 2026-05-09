@@ -14,6 +14,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -90,7 +91,11 @@ public final class RpcChannel {
     private void scheduleReconnect() {
         long delay = BACKOFF_MS[Math.min(backoffIdx++, BACKOFF_MS.length - 1)];
         log.info("reconnecting to %s in %d ms", peerId.value(), delay);
-        scheduler.schedule(this::tryConnect, delay, TimeUnit.MILLISECONDS);
+        try {
+            scheduler.schedule(this::tryConnect, delay, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException ignored) {
+            // Scheduler has been shut down — the node is stopping, no reconnect needed.
+        }
     }
 
     /**

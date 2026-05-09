@@ -10,6 +10,7 @@ import java.nio.ByteBuffer;
 import java.util.EnumMap;
 import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.function.BiConsumer;
 
 /**
@@ -59,11 +60,15 @@ public final class RpcDispatcher {
             log.warn("no handler registered for %s", frame.type());
             return;
         }
-        executor.execute(() -> {
-            byte[] responseBody = handler.handle(frame.body());
-            Frame response = new Frame(frame.type().responseType(), frame.reqId(), responseBody);
-            ByteBuffer encoded = FrameEncoder.encode(response);
-            writer.accept(ctx, encoded);
-        });
+        try {
+            executor.execute(() -> {
+                byte[] responseBody = handler.handle(frame.body());
+                Frame response = new Frame(frame.type().responseType(), frame.reqId(), responseBody);
+                ByteBuffer encoded = FrameEncoder.encode(response);
+                writer.accept(ctx, encoded);
+            });
+        } catch (RejectedExecutionException ignored) {
+            // Executor shut down — node is stopping, drop the frame silently.
+        }
     }
 }

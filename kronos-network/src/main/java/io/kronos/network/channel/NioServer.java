@@ -11,6 +11,7 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.*;
+import java.util.ConcurrentModificationException;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Queue;
@@ -68,11 +69,16 @@ public final class NioServer implements Runnable, Closeable {
     }
 
     private void processSelectedKeys() {
-        Iterator<SelectionKey> it = selector.selectedKeys().iterator();
-        while (it.hasNext()) {
-            SelectionKey key = it.next();
-            it.remove();
-            if (key.isValid()) processKey(key);
+        try {
+            Iterator<SelectionKey> it = selector.selectedKeys().iterator();
+            while (it.hasNext()) {
+                SelectionKey key = it.next();
+                it.remove();
+                if (key.isValid()) processKey(key);
+            }
+        } catch (ConcurrentModificationException ignored) {
+            // close() called selectedKeys.clear() via selector.close() from another thread
+            // while we were iterating — shutdown is in progress, stop processing keys.
         }
     }
 
