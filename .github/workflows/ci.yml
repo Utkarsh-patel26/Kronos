@@ -23,7 +23,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
 
       - name: Run tests
-        run: ./gradlew test
+        run: |
+          chmod +x gradlew
+          ./gradlew test
 
       - name: Upload test reports on failure
         if: failure()
