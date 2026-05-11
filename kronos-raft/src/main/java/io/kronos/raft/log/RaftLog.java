@@ -2,6 +2,7 @@ package io.kronos.raft.log;
 
 import io.kronos.common.model.LogEntry;
 import io.kronos.common.model.LogIndex;
+import io.kronos.common.model.Term;
 
 import java.util.List;
 
@@ -21,4 +22,10 @@ public interface RaftLog {
     void truncateFrom(LogIndex from);
 
     int size();
+
+    /** Index of the last entry covered by the most recent snapshot; ZERO if no snapshot. */
+    default LogIndex snapshotIndex() { return LogIndex.ZERO; }
+
+    /** Discard all in-memory entries and set the snapshot boundary. */
+    default void resetToSnapshot(LogIndex lastIndex, Term lastTerm) {}
 }

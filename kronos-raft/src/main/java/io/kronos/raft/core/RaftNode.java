@@ -6,17 +6,22 @@ import io.kronos.common.model.LogIndex;
 import io.kronos.common.model.NodeId;
 import io.kronos.common.model.Term;
 import io.kronos.network.codec.AppendEntriesCodec;
+import io.kronos.network.codec.InstallSnapshotCodec;
 import io.kronos.network.codec.RequestVoteCodec;
 import io.kronos.network.protocol.MessageType;
 import io.kronos.network.rpc.RpcChannel;
 import io.kronos.network.rpc.RpcDispatcher;
 import io.kronos.network.rpc.message.AppendEntriesRequest;
 import io.kronos.network.rpc.message.AppendEntriesResponse;
+import io.kronos.network.rpc.message.InstallSnapshotRequest;
+import io.kronos.network.rpc.message.InstallSnapshotResponse;
 import io.kronos.network.rpc.message.RequestVoteRequest;
 import io.kronos.network.rpc.message.RequestVoteResponse;
 import io.kronos.raft.election.ElectionTimer;
 import io.kronos.raft.election.VoteTracker;
 import io.kronos.raft.log.RaftLog;
+import io.kronos.storage.snapshot.SnapshotManager;
+import io.kronos.storage.snapshot.SnapshotMetadata;
 
 import java.io.*;
 import java.nio.ByteBuffer;
@@ -49,11 +54,14 @@ public final class RaftNode {
     private volatile RaftRole role          = FOLLOWER;
     private volatile NodeId   currentLeader = null;
     private volatile LogIndex commitIndex   = LogIndex.ZERO;
-    private          LogIndex lastApplied   = LogIndex.ZERO;
+    private volatile LogIndex lastApplied   = LogIndex.ZERO;
 
-    // Leader-only state, reset on every election win
-    private final Map<NodeId, LogIndex> nextIndex  = new HashMap<>();
-    private final Map<NodeId, LogIndex> matchIndex = new HashMap<>();
+    // Leader-only state, reset on every election win.
+    // ConcurrentHashMap so the HTTP thread can read snapshots safely.
+    private final ConcurrentHashMap<NodeId, LogIndex> nextIndex  = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<NodeId, LogIndex> matchIndex = new ConcurrentHashMap<>();
+    // Last time we heard from each peer (epoch ms). Updated on every successful replication.
+    private final ConcurrentHashMap<NodeId, Long> peerLastSeen = new ConcurrentHashMap<>();
 
     // Pending client writes — keyed by log index, completed when entry is committed
     private final Map<LogIndex, CompletableFuture<LogIndex>> pendingCommits = new HashMap<>();
@@ -69,13 +77,17 @@ public final class RaftNode {
     private final int                      heartbeatIntervalMs;
     private final ScheduledExecutorService raftThread;
 
+    // Snapshot support — both null if this node does not participate in snapshotting
+    private final SnapshotManager snapshotManager;
+    private final int             snapshotThreshold;
+
     private ScheduledFuture<?> heartbeatFuture;
 
     // -----------------------------------------------------------------------
     // Construction
     // -----------------------------------------------------------------------
 
-    /** Convenience constructor — uses a no-op state machine. */
+    /** Convenience constructor — uses a no-op state machine, no snapshot support. */
     public RaftNode(NodeId myId,
                     List<NodeId> peers,
                     Map<NodeId, RpcChannel> rpcChannels,
@@ -91,6 +103,7 @@ public final class RaftNode {
              raftThread, (idx, cmd) -> {});
     }
 
+    /** Full constructor with custom state machine, no snapshot support. */
     public RaftNode(NodeId myId,
                     List<NodeId> peers,
                     Map<NodeId, RpcChannel> rpcChannels,
@@ -102,6 +115,25 @@ public final class RaftNode {
                     int heartbeatIntervalMs,
                     ScheduledExecutorService raftThread,
                     StateMachine stateMachine) {
+        this(myId, peers, rpcChannels, rpcDispatcher, raftLog, dataDir,
+             electionTimeoutMinMs, electionTimeoutMaxMs, heartbeatIntervalMs,
+             raftThread, stateMachine, null, 0);
+    }
+
+    /** Full constructor with snapshot support. */
+    public RaftNode(NodeId myId,
+                    List<NodeId> peers,
+                    Map<NodeId, RpcChannel> rpcChannels,
+                    RpcDispatcher rpcDispatcher,
+                    RaftLog raftLog,
+                    Path dataDir,
+                    int electionTimeoutMinMs,
+                    int electionTimeoutMaxMs,
+                    int heartbeatIntervalMs,
+                    ScheduledExecutorService raftThread,
+                    StateMachine stateMachine,
+                    SnapshotManager snapshotManager,
+                    int snapshotThreshold) {
         this.myId               = myId;
         this.peers              = List.copyOf(peers);
         this.rpcChannels        = Map.copyOf(rpcChannels);
@@ -111,11 +143,21 @@ public final class RaftNode {
         this.dataDir            = dataDir;
         this.heartbeatIntervalMs = heartbeatIntervalMs;
         this.raftThread         = raftThread;
+        this.snapshotManager    = snapshotManager;
+        this.snapshotThreshold  = snapshotThreshold;
 
         this.electionTimer = new ElectionTimer(
             electionTimeoutMinMs, electionTimeoutMaxMs, raftThread, this::onElectionTimeout);
 
         loadPersistedState();
+
+        // If the log has a snapshot base, advance lastApplied/commitIndex accordingly
+        // so we don't try to re-apply already-snapshotted entries on startup.
+        LogIndex snapIdx = raftLog.snapshotIndex();
+        if (snapIdx.value() > 0) {
+            if (lastApplied.compareTo(snapIdx) < 0) lastApplied = snapIdx;
+            if (commitIndex.compareTo(snapIdx) < 0) commitIndex = snapIdx;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -132,6 +174,11 @@ public final class RaftNode {
             AppendEntriesRequest req = AppendEntriesCodec.decodeRequest(body);
             AppendEntriesResponse resp = handleAppendEntries(req);
             return AppendEntriesCodec.encodeResponse(resp);
+        });
+        rpcDispatcher.register(MessageType.INSTALL_SNAPSHOT_REQUEST, body -> {
+            InstallSnapshotRequest req = InstallSnapshotCodec.decodeRequest(body);
+            InstallSnapshotResponse resp = handleInstallSnapshot(req);
+            return InstallSnapshotCodec.encodeResponse(resp);
         });
         electionTimer.reset();
         log.info("node %s started (term=%d, role=%s)", myId.value(), currentTerm.value(), role);
@@ -171,7 +218,6 @@ public final class RaftNode {
                 advanceCommitIndex();
             });
         } catch (RejectedExecutionException e) {
-            // Raft thread shut down — node is no longer accepting writes
             future.completeExceptionally(new NotLeaderException(currentLeader));
         }
         return future;
@@ -205,7 +251,6 @@ public final class RaftNode {
     private void onElectionTimeout() {
         if (role == LEADER) return;
         if (role == CANDIDATE) {
-            // Timer fired while already a candidate — split vote or timeout; start a new election.
             startElection();
         } else {
             transitionTo(CANDIDATE);
@@ -313,20 +358,25 @@ public final class RaftNode {
         electionTimer.reset();
 
         // Rule 3: prevLog consistency check
-        LogIndex prevIdx = req.prevLogIndex();
+        LogIndex prevIdx  = req.prevLogIndex();
+        LogIndex snapIdx  = raftLog.snapshotIndex();
         if (prevIdx.value() > raftLog.lastEntry().index().value()) {
-            // We don't have the entry the leader thinks we do
             return new AppendEntriesResponse(currentTerm, false, raftLog.lastEntry().index());
         }
-        if (prevIdx.value() > 0) {
+        if (prevIdx.value() > 0 && prevIdx.value() >= snapIdx.value()) {
+            // prevIdx is at or after the snapshot boundary — perform term check
             LogEntry prevEntry = raftLog.entryAt(prevIdx);
             if (!prevEntry.term().equals(req.prevLogTerm())) {
                 return new AppendEntriesResponse(currentTerm, false, raftLog.lastEntry().index());
             }
         }
+        // if prevIdx < snapIdx the entry is covered by the snapshot; skip term check
 
         // Rule 4: append entries, truncating any conflicts first
         for (LogEntry incoming : req.entries()) {
+            // Skip entries already covered by our snapshot
+            if (incoming.index().value() <= snapIdx.value()) continue;
+
             LogIndex lastIdx = raftLog.lastEntry().index();
             if (incoming.index().value() <= lastIdx.value()) {
                 LogEntry existing = raftLog.entryAt(incoming.index());
@@ -345,7 +395,7 @@ public final class RaftNode {
 
         // Rule 5: advance commitIndex
         if (req.leaderCommit().compareTo(commitIndex) > 0) {
-            LogIndex myLast   = raftLog.lastEntry().index();
+            LogIndex myLast    = raftLog.lastEntry().index();
             LogIndex newCommit = req.leaderCommit().compareTo(myLast) < 0
                 ? req.leaderCommit() : myLast;
             if (newCommit.compareTo(commitIndex) > 0) {
@@ -355,6 +405,48 @@ public final class RaftNode {
         }
 
         return new AppendEntriesResponse(currentTerm, true, raftLog.lastEntry().index());
+    }
+
+    InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest req) {
+        // Reject stale snapshots
+        if (req.term().compareTo(currentTerm) < 0) {
+            return new InstallSnapshotResponse(currentTerm);
+        }
+        if (req.term().compareTo(currentTerm) > 0) {
+            currentTerm = req.term();
+            votedFor    = null;
+            persistTermAndVote();
+        }
+        if (role != FOLLOWER) transitionTo(FOLLOWER);
+        currentLeader = req.leaderId();
+        electionTimer.reset();
+
+        if (snapshotManager == null) {
+            return new InstallSnapshotResponse(currentTerm);
+        }
+
+        try {
+            snapshotManager.writeChunk(req.offset(), req.data());
+
+            if (req.done()) {
+                SnapshotMetadata meta = snapshotManager.finalizeChunked(
+                    req.lastIncludedIndex(), req.lastIncludedTerm());
+
+                if (stateMachine instanceof SnapshotableStateMachine sm) {
+                    sm.installSnapshot(snapshotManager.loadState(meta));
+                }
+
+                raftLog.resetToSnapshot(req.lastIncludedIndex(), req.lastIncludedTerm());
+                commitIndex = req.lastIncludedIndex();
+                lastApplied = req.lastIncludedIndex();
+                log.info("node %s installed snapshot at index %d",
+                    myId.value(), req.lastIncludedIndex().value());
+            }
+        } catch (Exception e) {
+            log.warn("InstallSnapshot failed: %s", e.getMessage());
+        }
+
+        return new InstallSnapshotResponse(currentTerm);
     }
 
     // -----------------------------------------------------------------------
@@ -397,10 +489,6 @@ public final class RaftNode {
         }
     }
 
-    /**
-     * Heartbeats and replication share the same code path: replicateTo() sends
-     * whatever entries the peer is missing (possibly none = pure heartbeat).
-     */
     private void sendHeartbeats() {
         if (role != LEADER) {
             stopHeartbeating();
@@ -421,17 +509,21 @@ public final class RaftNode {
 
         LogIndex next = nextIndex.getOrDefault(peer, raftLog.lastEntry().index().increment());
 
-        // A follower can report a matchIndex beyond our log (e.g. it has extra entries
-        // from a previous leader that we don't have). Cap nextIndex so prevIdx stays
-        // within our log and entryAt() doesn't throw.
         LogIndex leaderLast = raftLog.lastEntry().index();
         if (next.compareTo(leaderLast.increment()) > 0) {
             next = leaderLast.increment();
             nextIndex.put(peer, next);
         }
 
-        LogIndex prevIdx = new LogIndex(next.value() - 1);  // safe: next >= 1 always
-        LogEntry prev    = raftLog.entryAt(prevIdx);        // returns sentinel for ZERO
+        // If the peer needs entries that have been compacted into our snapshot, send it
+        LogIndex snapIdx = raftLog.snapshotIndex();
+        if (snapshotManager != null && snapIdx.value() > 0 && next.value() <= snapIdx.value()) {
+            sendSnapshotTo(peer);
+            return;
+        }
+
+        LogIndex prevIdx = new LogIndex(next.value() - 1);
+        LogEntry prev    = raftLog.entryAt(prevIdx);
 
         List<LogEntry> all   = raftLog.entriesFrom(next);
         List<LogEntry> batch = all.size() > MAX_BATCH_SIZE ? all.subList(0, MAX_BATCH_SIZE) : all;
@@ -452,9 +544,64 @@ public final class RaftNode {
             });
     }
 
+    private void sendSnapshotTo(NodeId peer) {
+        SnapshotMetadata snap;
+        try {
+            snap = snapshotManager.latestSnapshot();
+        } catch (Exception e) {
+            log.warn("failed to read snapshot metadata for %s: %s", peer.value(), e.getMessage());
+            return;
+        }
+        if (snap == null) return;
+
+        byte[] snapBytes;
+        try {
+            snapBytes = snapshotManager.readRaw(snap);
+        } catch (Exception e) {
+            log.warn("failed to read snapshot bytes for %s: %s", peer.value(), e.getMessage());
+            return;
+        }
+
+        RpcChannel channel = rpcChannels.get(peer);
+        if (channel == null) return;
+
+        Term capturedTerm = currentTerm;
+        InstallSnapshotRequest req = new InstallSnapshotRequest(
+            capturedTerm, myId,
+            snap.lastIncludedIndex(), snap.lastIncludedTerm(),
+            0, snapBytes, true);
+
+        channel.send(
+                MessageType.INSTALL_SNAPSHOT_REQUEST,
+                InstallSnapshotCodec.encodeRequest(req),
+                frame -> InstallSnapshotCodec.decodeResponse(frame.body()))
+            .thenAcceptAsync(
+                resp -> onInstallSnapshotResponse(peer, resp, capturedTerm, snap), raftThread)
+            .exceptionally(ex -> {
+                log.warn("snapshot install to %s failed: %s", peer.value(), ex.getMessage());
+                return null;
+            });
+    }
+
+    private void onInstallSnapshotResponse(NodeId peer, InstallSnapshotResponse resp,
+                                            Term reqTerm, SnapshotMetadata snap) {
+        if (resp.term().compareTo(currentTerm) > 0) {
+            currentTerm = resp.term();
+            votedFor    = null;
+            persistTermAndVote();
+            transitionTo(FOLLOWER);
+            return;
+        }
+        if (role != LEADER || !currentTerm.equals(reqTerm)) return;
+
+        LogIndex snapIdx = snap.lastIncludedIndex();
+        matchIndex.put(peer, snapIdx);
+        nextIndex.put(peer, snapIdx.increment());
+        advanceCommitIndex();
+    }
+
     private void onReplicationResponse(NodeId peer,
                                         AppendEntriesResponse resp, Term reqTerm) {
-        // Step down if a higher term is observed
         if (resp.term().compareTo(currentTerm) > 0) {
             currentTerm = resp.term();
             votedFor    = null;
@@ -463,32 +610,27 @@ public final class RaftNode {
             return;
         }
 
-        // Discard stale responses (e.g. from a previous leadership term)
         if (role != LEADER || !currentTerm.equals(reqTerm)) return;
 
         if (resp.success()) {
-            LogIndex newMatch   = resp.matchIndex();
-            LogIndex curMatch   = matchIndex.getOrDefault(peer, LogIndex.ZERO);
+            peerLastSeen.put(peer, System.currentTimeMillis());
+            LogIndex newMatch = resp.matchIndex();
+            LogIndex curMatch = matchIndex.getOrDefault(peer, LogIndex.ZERO);
             if (newMatch.compareTo(curMatch) > 0) {
                 matchIndex.put(peer, newMatch);
                 nextIndex.put(peer, newMatch.increment());
             }
             advanceCommitIndex();
 
-            // Continue replication if the peer is still behind
             if (nextIndex.get(peer).compareTo(raftLog.lastEntry().index()) <= 0) {
                 replicateTo(peer);
             }
         } else {
-            // Log inconsistency — back up nextIndex.
-            // Use the follower's matchIndex as a hint to skip ahead when it's simply behind.
             LogIndex hint    = resp.matchIndex().increment();
             LogIndex current = nextIndex.getOrDefault(peer, LogIndex.ONE);
             if (hint.compareTo(current) < 0) {
-                // Follower is behind — jump directly to the right point
                 nextIndex.put(peer, hint);
             } else if (current.value() > 1) {
-                // Term conflict — walk back one step at a time
                 nextIndex.put(peer, current.decrement());
             }
             replicateTo(peer);
@@ -499,26 +641,25 @@ public final class RaftNode {
     // Commit index advancement
     // -----------------------------------------------------------------------
 
-    /**
-     * After any matchIndex update, find the highest log index held by a
-     * majority of nodes (including the leader itself) and advance commitIndex
-     * to it — provided it belongs to the current term (Raft safety rule §5.4.2).
-     */
     private void advanceCommitIndex() {
         List<Long> sorted = new ArrayList<>(peers.size() + 1);
-        sorted.add(raftLog.lastEntry().index().value()); // leader always has its own entries
+        sorted.add(raftLog.lastEntry().index().value());
         for (NodeId peer : peers) {
             sorted.add(matchIndex.getOrDefault(peer, LogIndex.ZERO).value());
         }
         sorted.sort(Comparator.reverseOrder());
 
-        // Element at index (N/2) is the majority threshold for N nodes
         long majorityMatch = sorted.get(sorted.size() / 2);
         if (majorityMatch == 0) return;
 
         LogIndex candidate = LogIndex.of(majorityMatch);
-        if (candidate.compareTo(commitIndex) > 0
-                && raftLog.entryAt(candidate).term().equals(currentTerm)) {
+        if (candidate.compareTo(commitIndex) <= 0) return;
+
+        // Safety: only commit entries from the current term
+        LogIndex snapIdx = raftLog.snapshotIndex();
+        if (candidate.value() <= snapIdx.value()) return; // already in snapshot
+
+        if (raftLog.entryAt(candidate).term().equals(currentTerm)) {
             commitIndex = candidate;
             applyCommitted();
             completePendingCommits();
@@ -526,7 +667,7 @@ public final class RaftNode {
     }
 
     // -----------------------------------------------------------------------
-    // Apply and pending-commit bookkeeping
+    // Apply, snapshot, and pending-commit bookkeeping
     // -----------------------------------------------------------------------
 
     private void applyCommitted() {
@@ -534,6 +675,24 @@ public final class RaftNode {
             lastApplied = lastApplied.increment();
             LogEntry entry = raftLog.entryAt(lastApplied);
             stateMachine.apply(lastApplied, entry.payload());
+        }
+        maybeSnapshot();
+    }
+
+    private void maybeSnapshot() {
+        if (snapshotManager == null) return;
+        if (!(stateMachine instanceof SnapshotableStateMachine sm)) return;
+        if (raftLog.size() < snapshotThreshold) return;
+
+        try {
+            byte[]   state           = sm.takeSnapshot();
+            LogEntry lastEntry       = raftLog.entryAt(lastApplied);
+            snapshotManager.save(lastApplied, lastEntry.term(), state);
+            raftLog.resetToSnapshot(lastApplied, lastEntry.term());
+            log.info("node %s snapshotted at index %d (log compacted)",
+                myId.value(), lastApplied.value());
+        } catch (Exception e) {
+            log.warn("snapshot failed: %s", e.getMessage());
         }
     }
 
@@ -613,5 +772,71 @@ public final class RaftNode {
     public NodeId currentLeader() { return currentLeader; }
     public NodeId id()            { return myId; }
     public LogIndex commitIndex() { return commitIndex; }
+    public LogIndex lastApplied() { return lastApplied; }
+    public List<NodeId> peers()   { return peers; }
     public int logSize()          { return raftLog.size(); }
+
+    /** matchIndex for a peer (leader state); returns ZERO if not leader or peer unknown. */
+    public LogIndex matchIndex(NodeId peer) {
+        return matchIndex.getOrDefault(peer, LogIndex.ZERO);
+    }
+
+    /** nextIndex for a peer (leader state); returns ZERO if not leader or peer unknown. */
+    public LogIndex nextIndex(NodeId peer) {
+        return nextIndex.getOrDefault(peer, LogIndex.ZERO);
+    }
+
+    /** Epoch-ms of the last successful replication to peer; -1 if never seen. */
+    public long peerLastSeenMs(NodeId peer) {
+        return peerLastSeen.getOrDefault(peer, -1L);
+    }
+
+    /**
+     * Returns the most recent {@code limit} committed log entries, fetched
+     * safely from the Raft thread.  Entries already compacted into a snapshot
+     * are not available and will simply not appear.
+     */
+    public CompletableFuture<List<LogEntry>> recentEntries(int limit) {
+        CompletableFuture<List<LogEntry>> f = new CompletableFuture<>();
+        try {
+            raftThread.execute(() -> {
+                LogIndex last    = raftLog.lastEntry().index();
+                LogIndex snapIdx = raftLog.snapshotIndex();
+                if (last.value() == 0) {
+                    f.complete(List.of());
+                    return;
+                }
+                long startVal = Math.max(last.value() - limit + 1,
+                                         snapIdx.value() + 1);
+                if (startVal < 1) startVal = 1;
+                List<LogEntry> entries = raftLog.entriesFrom(LogIndex.of(startVal));
+                if (entries.size() > limit) {
+                    entries = entries.subList(entries.size() - limit, entries.size());
+                }
+                f.complete(List.copyOf(entries));
+            });
+        } catch (RejectedExecutionException e) {
+            f.completeExceptionally(e);
+        }
+        return f;
+    }
+
+    /**
+     * Returns a future that completes normally if this node is still the leader
+     * when the check executes on the Raft thread, or fails with
+     * {@link NotLeaderException} if not.  Used by the HTTP layer to confirm
+     * leadership before serving linearizable reads.
+     */
+    public CompletableFuture<Void> confirmLeadership() {
+        CompletableFuture<Void> f = new CompletableFuture<>();
+        try {
+            raftThread.execute(() -> {
+                if (role == LEADER) f.complete(null);
+                else f.completeExceptionally(new NotLeaderException(currentLeader));
+            });
+        } catch (RejectedExecutionException e) {
+            f.completeExceptionally(new NotLeaderException(currentLeader));
+        }
+        return f;
+    }
 }

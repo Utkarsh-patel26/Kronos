@@ -5,11 +5,7 @@ import io.kronos.common.model.NodeId;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Objects;
-import java.util.Properties;
+import java.util.*;
 
 /**
  * Static, validated configuration for a single Kronos node.
@@ -30,6 +26,8 @@ public final class KronosConfig {
     public final int raftPort;
     public final int httpPort;
     public final List<PeerConfig> peers;
+    /** Optional map of peer nodeId → "host:httpPort" for HTTP redirect support. */
+    public final Map<NodeId, String> peerHttpAddresses;
     public final Path dataDir;
     public final int electionTimeoutMinMs;
     public final int electionTimeoutMaxMs;
@@ -42,6 +40,7 @@ public final class KronosConfig {
         this.raftPort = requirePort(b.raftPort, "raft.port");
         this.httpPort = requirePort(b.httpPort, "http.port");
         this.peers = Collections.unmodifiableList(new ArrayList<>(b.peers));
+        this.peerHttpAddresses = Collections.unmodifiableMap(new LinkedHashMap<>(b.peerHttpAddresses));
         this.dataDir = Objects.requireNonNull(b.dataDir, "data.dir is required");
         this.electionTimeoutMinMs = requirePositive(b.electionTimeoutMinMs, "election.timeout.min.ms");
         this.electionTimeoutMaxMs = requirePositive(b.electionTimeoutMaxMs, "election.timeout.max.ms");
@@ -116,6 +115,16 @@ public final class KronosConfig {
                 b.addPeer(parsePeer(chunk.trim()));
             }
         }
+        String peersHttpRaw = p.getProperty("peers.http", "").trim();
+        if (!peersHttpRaw.isEmpty()) {
+            for (String chunk : peersHttpRaw.split(",")) {
+                int eq = chunk.indexOf('=');
+                if (eq > 0 && eq < chunk.length() - 1) {
+                    b.addPeerHttpAddress(NodeId.of(chunk.substring(0, eq).trim()),
+                                        chunk.substring(eq + 1).trim());
+                }
+            }
+        }
         return b.build();
     }
 
@@ -171,6 +180,7 @@ public final class KronosConfig {
         private int raftPort;
         private int httpPort;
         private final List<PeerConfig> peers = new ArrayList<>();
+        private final Map<NodeId, String> peerHttpAddresses = new LinkedHashMap<>();
         private Path dataDir;
         private int electionTimeoutMinMs = DEFAULT_ELECTION_TIMEOUT_MIN_MS;
         private int electionTimeoutMaxMs = DEFAULT_ELECTION_TIMEOUT_MAX_MS;
@@ -184,6 +194,7 @@ public final class KronosConfig {
         public Builder dataDir(Path v)                { this.dataDir = v; return this; }
         public Builder addPeer(PeerConfig v)          { this.peers.add(v); return this; }
         public Builder peers(List<PeerConfig> v)      { this.peers.clear(); this.peers.addAll(v); return this; }
+        public Builder addPeerHttpAddress(NodeId id, String hostPort) { this.peerHttpAddresses.put(id, hostPort); return this; }
         public Builder electionTimeoutMinMs(int v)    { this.electionTimeoutMinMs = v; return this; }
         public Builder electionTimeoutMaxMs(int v)    { this.electionTimeoutMaxMs = v; return this; }
         public Builder heartbeatIntervalMs(int v)     { this.heartbeatIntervalMs = v; return this; }
